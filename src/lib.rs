@@ -1,3 +1,4 @@
+pub mod pay;
 use bellman::{
     Circuit, ConstraintSystem, LinearCombination, SynthesisError,
     gadgets::{boolean::Boolean, num::AllocatedNum},
@@ -129,6 +130,14 @@ impl<Scalar: PrimeField + PrimeFieldBits> Circuit<Scalar> for SettlementCircuit<
                 &nonce_bits[i],
             )?;
         }
+
+        // 6. M (max_nonce) must equal last nonce
+        cs.enforce(
+            || "m_equals_last_nonce",
+            |lc| lc + m.get_variable() - nonces[N - 1].get_variable(),
+            |lc| lc + CS::one(),
+            |lc| lc, // = 0
+        );
 
         Ok(())
     }

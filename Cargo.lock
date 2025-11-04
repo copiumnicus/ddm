@@ -130,6 +130,7 @@ dependencies = [
  "bellman",
  "bls12_381",
  "ff",
+ "num_cpus",
  "rand",
  "rand_xorshift",
 ]

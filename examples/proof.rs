@@ -4,6 +4,8 @@ use ddm::N;
 use ddm::SettlementCircuit;
 use ff::Field;
 use rand::thread_rng;
+use std::fmt;
+use std::time::Duration;
 use std::time::Instant;
 
 fn fr(x: u64) -> Scalar {
@@ -13,6 +15,71 @@ fn fr(x: u64) -> Scalar {
 // Helper: [None; N] for Option<Scalar>
 fn none_array() -> [Option<Scalar>; N] {
     std::array::from_fn(|_| None)
+}
+
+#[derive(Debug)]
+pub struct ProofMetrics {
+    pub cost_per_proof: f64,     // $
+    pub cost_per_signature: f64, // $
+    pub sigs_per_second: f64,    // sig/s
+    pub core_seconds_per_proof: f64,
+    pub core_seconds_per_sig: f64,
+}
+
+impl fmt::Display for ProofMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "=== Proof Metrics ===")?;
+        writeln!(f, "sigs/sec              : {:>10.2}", self.sigs_per_second)?;
+        writeln!(
+            f,
+            "core-sec / proof      : {:>10.4}",
+            self.core_seconds_per_proof
+        )?;
+        writeln!(
+            f,
+            "core-sec / sig        : {:>10.6}",
+            self.core_seconds_per_sig
+        )?;
+        writeln!(f, "cost / proof (USD)    : ${:>10.8}", self.cost_per_proof)?;
+        writeln!(
+            f,
+            "cost / signature (USD): ${:>10.8}",
+            self.cost_per_signature
+        )?;
+        Ok(())
+    }
+}
+
+pub fn compute_metrics(
+    n_sigs: usize,
+    proof_time: Duration,
+    cpu_cores_used: usize,
+    cpu_core_cost_per_hour: f64, // $ per core-hour
+) -> ProofMetrics {
+    let t_sec = proof_time.as_secs_f64();
+    let n = n_sigs as f64;
+    let cores = cpu_cores_used as f64;
+
+    // total CPU time
+    let core_seconds_per_proof = t_sec * cores;
+    let core_seconds_per_sig = core_seconds_per_proof / n;
+
+    // cost
+    let core_hours_per_proof = core_seconds_per_proof / 3600.0;
+    let cost_per_proof = core_hours_per_proof * cpu_core_cost_per_hour;
+    let cost_per_signature = cost_per_proof / n;
+
+    // throughput
+    let proofs_per_second = 1.0 / t_sec;
+    let sigs_per_second = proofs_per_second * n;
+
+    ProofMetrics {
+        cost_per_proof,
+        cost_per_signature,
+        sigs_per_second,
+        core_seconds_per_proof,
+        core_seconds_per_sig,
+    }
 }
 
 fn main() {
@@ -45,7 +112,7 @@ fn main() {
     let k_old_val = fr(10);
     let size_val_u64 = 5u64;
     let total_settle_val = fr(size_val_u64 * N as u64);
-    let m_val = fr((N + offset) as u64); // max nonce
+    let m_val = fr((N - 1 + offset) as u64); // max nonce
 
     // Fill arrays of Option<Scalar>
     let mut to = none_array();
@@ -69,14 +136,15 @@ fn main() {
         nonce,
     };
 
-    let _k = Instant::now();
+    let k = Instant::now();
     // ------------------------------
     // 3. Prove
     // ------------------------------
     let proof = groth16::create_random_proof(circuit, &params, &mut rng)
         .expect("proof generation should succeed");
 
-    println!("proof gen {:?}", _k.elapsed());
+    println!("proof gen {:?}", k.elapsed());
+    println!("{}", compute_metrics(N, k.elapsed(), num_cpus::get(), 0.05));
 
     // ------------------------------
     // 4. Verify
