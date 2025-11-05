@@ -1,3 +1,4 @@
+pub mod hash;
 pub mod pay;
 use bellman::{
     Circuit, ConstraintSystem, LinearCombination, SynthesisError,
