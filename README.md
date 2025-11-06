@@ -1,7 +1,9 @@
 # ddm
 
 [X] - safety curve for safe unclaimed balance for vendors
+
 [ ] - bench cost of 1 to N sigs with zk batching
+
 [ ] - What is settlement cost? How does it scale?
 
 
@@ -10,3 +12,9 @@ Jubjub-Schnorr, RedDSA, Poseidon-EdDSA
 
 
 https://github.com/ConsenSys/gnark
+
+https://docs.gnark.consensys.net/Tutorials/eddsa
+
+standard lib
+https://docs.gnark.consensys.net/HowTo/write/standard_library
+
