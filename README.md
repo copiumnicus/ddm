@@ -52,4 +52,24 @@ CPU price: $0.0500 / core-hour → cost per proof: $0.000937
 Batch value (min tx $0.0050): $1.2800
 Proof cost / batch value: 0.07%
 Throughput at full load: $819.36 /h, $19664.73 /day, $7177628 /year
+
+Finally 512 (pushing limits for small vms):
+
+Proving key size (N = 512) (serialized): 951.99 MB (998234331 bytes)
+=== Compression report (N = 512) ===
+Field element size: 32 bytes (BN254 scalar field)
+Per-tx naive payload (Recipient, Size, Nonce, ChainID, Signature):
+  preimage fields: 4 × 32 B = 128 B
+  signature: 96 B
+  → total per tx: 224 bytes
+Total naive calldata for 512 txs: 114688 bytes
+Groth16 proof size: 164 bytes
+Calldata/proof ratio: 699.32x
+
+=== Economics report (N = 512, cores = 12) ===
+Prove time: 11.254604542s, cores: 12 → CPU-seconds: 135.06
+CPU price: $0.0500 / core-hour → cost per proof: $0.001876
+Batch value (min tx $0.0050): $2.5600
+Proof cost / batch value: 0.07%
+Throughput at full load: $818.86 /h, $19652.76 /day, $7173256 /year
 ```

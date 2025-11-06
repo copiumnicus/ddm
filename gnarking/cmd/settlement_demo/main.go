@@ -64,14 +64,29 @@ func reportEconomics(N int, proveTime time.Duration) {
 		usdPerHour, usdPerDay, usdPerYear)
 }
 
-// N = 32
-// 12 cores on m3 mac = 700ms prove time = 8 cpusec
-// cost cpu $0.05/h
-// (12 * 0.05) * (8/3600) = $0.0014 cost to prove
-// say min tx is $0.005 this would be then $0.16
-// (0.0014/0.16) = 0.87% zk proof costs less than 1% of the 0.16$ value
-// at full blast 12 cores could be proving $72/h $1728/day $620,500/year
-// so the 12 cores could support a business that accepts $620k in micropayments per year
+// proofBytes: serialized Groth16 proof size (from proof.WriteTo)
+func reportCompression(proofBytes int64) {
+	feBytes := len(ecc.BN254.ScalarField().Bytes()) // 32 bytes on BN254
+
+	sigBytes := 3 * feBytes         // R.X, R.Y, S
+	preimageFields := 4             // Recipient, Size, Nonce, ChainID
+	tuplePerTxBytes := preimageFields*feBytes + sigBytes
+
+	totalTupleBytes := int64(circuit.N) * int64(tuplePerTxBytes)
+	ratio := float64(totalTupleBytes) / float64(proofBytes)
+
+	fmt.Printf("\n=== Compression report (N = %d) ===\n", circuit.N)
+	fmt.Printf("Field element size: %d bytes (BN254 scalar field)\n", feBytes)
+	fmt.Printf("Per-tx naive payload (Recipient, Size, Nonce, ChainID, Signature):\n")
+	fmt.Printf("  preimage fields: %d × %d B = %d B\n", preimageFields, feBytes, preimageFields*feBytes)
+	fmt.Printf("  signature: %d B\n", sigBytes)
+	fmt.Printf("  → total per tx: %d bytes\n", tuplePerTxBytes)
+	fmt.Printf("Total naive calldata for %d txs: %d bytes\n", circuit.N, totalTupleBytes)
+	fmt.Printf("Groth16 proof size: %d bytes\n", proofBytes)
+	fmt.Printf("Calldata/proof ratio: %.2fx\n", ratio)
+}
+
+
 func main() {
 	// 1) Compile the SettlementCircuit
 	var c circuit.SettlementCircuit
@@ -165,5 +180,11 @@ func main() {
 	fmt.Printf("Settlement verifier took %s\n", time.Since(start))
 
 	fmt.Println("Groth16 settlement proof verified ✅")
+
+	cwProof := &countingWriter{}
+	if _, err := proof.WriteTo(cwProof); err != nil {
+		panic(err)
+	}
+	reportCompression(cwProof.n)
 	reportEconomics(circuit.N, proveTime)
 }
