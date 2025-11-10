@@ -2,7 +2,13 @@ package main
 
 import (
 	"crypto/rand"
+	"path/filepath"
+	// "encoding/binary"
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	fr_bn254 "github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"io"
 	"math/big"
 	"os"
@@ -15,13 +21,14 @@ import (
 	nativeEddsa "github.com/consensys/gnark-crypto/signature/eddsa"
 
 	"github.com/consensys/gnark/backend/groth16"
-	cs_bn254 "github.com/consensys/gnark/constraint/bn254"
 	groth16_bn254 "github.com/consensys/gnark/backend/groth16/bn254"
+	cs_bn254 "github.com/consensys/gnark/constraint/bn254"
 	// "github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 
 	// "github.com/consensys/gnark/backend/witness"
+	"github.com/consensys/gnark/backend/witness"
 
 	"flag"
 	"gnarking/circuit"
@@ -115,13 +122,103 @@ func read(fName string, r io.ReaderFrom) {
 	check(err)
 }
 
+type PublicInputsHex []string
+
+var _ io.WriterTo = (*PublicInputsHex)(nil)
+
+func NewPublicInputsHexFromWitness(w witness.Witness) (PublicInputsHex, error) {
+	raw := w.Vector()
+	vec, ok := raw.(fr_bn254.Vector)
+	if !ok {
+		return nil, fmt.Errorf("unexpected witness vector type %T", raw)
+	}
+
+	out := make([]string, len(vec))
+	for i := range vec {
+		b := vec[i].BigInt(new(big.Int))   // fr.Element -> *big.Int
+		out[i] = fmt.Sprintf("0x%064x", b) // 32-byte, 0x-prefixed
+	}
+
+	return out, nil
+}
+func (p *PublicInputsHex) WriteTo(w io.Writer) (int64, error) {
+	b, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return 0, err
+	}
+	return bytes.NewReader(b).WriteTo(w)
+}
+
+type ProofWrap [8]string
+
+func NewProofWrap(g *groth16_bn254.Proof) (ProofWrap, error) {
+	raw := g.MarshalSolidity()
+	if len(raw) != 8*32 {
+		return ProofWrap{}, fmt.Errorf("invalid proof length: got %d", len(raw))
+	}
+
+	var w ProofWrap
+	for i := 0; i < 8; i++ {
+		w[i] = "0x" + hex.EncodeToString(raw[i*32:(i+1)*32])
+	}
+	return w, nil
+}
+
+var _ io.WriterTo = (*ProofWrap)(nil)
+var _ io.ReaderFrom = (*ProofWrap)(nil)
+
+func (p *ProofWrap) WriteTo(w io.Writer) (int64, error) {
+	b, err := json.MarshalIndent(p, "", "\t")
+	if err != nil {
+		return 0, err
+	}
+	return bytes.NewReader(b).WriteTo(w)
+}
+
+func (p *ProofWrap) ReadFrom(r io.Reader) (int64, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+	if err := json.Unmarshal(data, p); err != nil {
+		return int64(len(data)), err
+	}
+	return int64(len(data)), nil
+}
+
+// DeleteMatchingFiles removes all files in dir matching pattern
+func DeleteMatchingFiles(dir string, patter string) error {
+	pattern := filepath.Join(dir, patter)
+
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return fmt.Errorf("invalid pattern: %w", err)
+	}
+
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func main() {
 	var (
-		pkName     = fmt.Sprintf("./artifact/pk_%d.groth16", circuit.N)
-		ccsName    = fmt.Sprintf("./artifact/ccs_%d.groth16", circuit.N)
-		vkName     = fmt.Sprintf("./artifact/vk_%d.groth16", circuit.N)
-		proofName  = fmt.Sprintf("./artifact/proof_%d.groth16", circuit.N)
-		publicName = fmt.Sprintf("./artifact/public_name_%d.json", circuit.N)
+		pkName            = fmt.Sprintf("./artifact/pk_%d.groth16", circuit.N)
+		ccsName           = fmt.Sprintf("./artifact/ccs_%d.groth16", circuit.N)
+		vkName            = fmt.Sprintf("./artifact/vk_%d.groth16", circuit.N)
+		proofName         = fmt.Sprintf("./artifact/proof_%d.groth16", circuit.N)
+		proofJsonName     = fmt.Sprintf("./artifact/proof_%d.json", circuit.N)
+		publicName        = fmt.Sprintf("./artifact/public_%d.json", circuit.N)
+		publicSolJsonName = fmt.Sprintf("./artifact/public_sol_%d.json", circuit.N)
+		verifyName        = fmt.Sprintf("./artifact/settlement_verifier_%d.sol", circuit.N)
 	)
 
 	setup := flag.Bool("setup", false, "run circuit setup (compile + generate keys)")
@@ -130,15 +227,24 @@ func main() {
 	flag.Parse()
 
 	if *setup {
+		fmt.Println("Deleting old artifacts")
+		check(DeleteMatchingFiles("./artifact", "*_8.*"))
 		fmt.Println("Setting up N = %d", circuit.N)
 		var c circuit.SettlementCircuit
 		ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &c)
 		check(err)
 		pk, vk, err := groth16.Setup(ccs)
+		check(err)
 		dump(ccsName, ccs)
 		dump(pkName, pk)
 		dump(vkName, vk)
-		check(err)
+		{
+			vkFile, err := os.Create(verifyName)
+			check(err)
+			defer vkFile.Close()
+			check(vk.ExportSolidity(vkFile))
+			fmt.Println("Solidity verifier exported to settlement_verifier.sol")
+		}
 		cw := &countingWriter{}
 		_, err = pk.WriteTo(cw)
 		check(err)
@@ -148,7 +254,7 @@ func main() {
 		// have to init to read ...
 		var (
 			ccs cs_bn254.R1CS
-			pk groth16_bn254.ProvingKey
+			pk  groth16_bn254.ProvingKey
 		)
 		read(pkName, &pk)
 		read(ccsName, &ccs)
@@ -208,7 +314,7 @@ func main() {
 
 		// 6) Prove
 		start := time.Now()
-		proof, err := groth16.Prove(&ccs, &pk, witness)
+		proof, err := groth16_bn254.Prove(&ccs, &pk, witness)
 		if err != nil {
 			panic(err)
 		}
@@ -217,6 +323,14 @@ func main() {
 
 		reportEconomics(circuit.N, proveTime)
 
+		wit, err := witness.Public()
+		check(err)
+		pubHex, err := NewPublicInputsHexFromWitness(wit)
+		check(err)
+		dump(publicSolJsonName, &pubHex)
+		var pj ProofWrap
+		pj, _ = NewProofWrap(proof)
+		dump(proofJsonName, &pj)
 		dump(proofName, proof)
 		dump(publicName, &w.P)
 	}
@@ -234,25 +348,14 @@ func main() {
 			P: publicWitness,
 		}
 		pubWit, err := frontend.NewWitness(assignment, ecc.BN254.ScalarField(), frontend.PublicOnly())
+		check(err)
 		// 7) Verify
 		start := time.Now()
 		if err := groth16.Verify(&proof, &vk, pubWit); err != nil {
 			panic(err)
 		}
 		fmt.Printf("Settlement verifier took %s\n", time.Since(start))
-
-		fmt.Println("Groth16 settlement proof verified ✅")
-
-		vkFile, err := os.Create(fmt.Sprintf("settlement_verifier_%d.sol", circuit.N))
-		if err != nil {
-			panic(err)
-		}
-		defer vkFile.Close()
-
-		if err := vk.ExportSolidity(vkFile); err != nil {
-			panic(err)
-		}
-		fmt.Println("Solidity verifier exported to settlement_verifier.sol")
+		fmt.Println("Groth16 settlement proof verified")
 
 		cwProof := &countingWriter{}
 		if _, err := proof.WriteTo(cwProof); err != nil {

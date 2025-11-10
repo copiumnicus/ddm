@@ -1,2 +1,3 @@
 artifact/*.groth16
 artifact/*.json
+artifact/*.sol
