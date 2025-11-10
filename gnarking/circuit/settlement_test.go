@@ -13,6 +13,7 @@ import (
 	"github.com/consensys/gnark/test"
 )
 
+
 func TestSettlementCircuit_EdDSA(t *testing.T) {
 	assert := test.NewAssert(t)
 
@@ -33,9 +34,9 @@ func TestSettlementCircuit_EdDSA(t *testing.T) {
 	// --------------------
 	var valid SettlementCircuit
 
-	valid.Recipient = recipient
-	valid.ChainID = chainID
-	valid.KOld = kOld
+	valid.P.Recipient = recipient
+	valid.P.ChainID = chainID
+	valid.P.KOld = kOld
 
 	total := big.NewInt(0)
 
@@ -64,9 +65,9 @@ func TestSettlementCircuit_EdDSA(t *testing.T) {
 		total.Add(total, size)
 	}
 
-	valid.TotalSettle = total
-	valid.M = big.NewInt(int64(N)) // last nonce
-	valid.Pk.Assign(te.BN254, pkBytes)
+	valid.P.TotalSettle = total
+	valid.P.M = big.NewInt(int64(N)) // last nonce
+	valid.P.Pk.Assign(te.BN254, pkBytes)
 
 	// Circuit template
 	var c SettlementCircuit
@@ -82,7 +83,7 @@ func TestSettlementCircuit_EdDSA(t *testing.T) {
 	// INVALID 1: wrong TotalSettle
 	// --------------------
 	invalidSum := valid
-	invalidSum.TotalSettle = new(big.Int).Add(total, big.NewInt(1))
+	invalidSum.P.TotalSettle = new(big.Int).Add(total, big.NewInt(1))
 
 	assert.ProverFailed(
 		&c,
@@ -111,7 +112,7 @@ func TestSettlementCircuit_EdDSA(t *testing.T) {
 	otherPkBytes := otherPub.Bytes()
 
 	invalidPk := valid
-	invalidPk.Pk.Assign(te.BN254, otherPkBytes)
+	invalidPk.P.Pk.Assign(te.BN254, otherPkBytes)
 
 	assert.ProverFailed(
 		&c,

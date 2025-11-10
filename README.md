@@ -1,5 +1,9 @@
 # ddm
 
+```bash
+go install github.com/consensys/gnark/cmd/gnark@v0.14.0
+```
+
 ```text
 ./gnarking/circuit/settlement.go
 N (number of micropayments in zk batch)

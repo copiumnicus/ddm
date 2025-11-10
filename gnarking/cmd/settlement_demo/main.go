@@ -2,9 +2,11 @@ package main
 
 import (
 	"crypto/rand"
-	"runtime"
 	"fmt"
+	"io"
 	"math/big"
+	"os"
+	"runtime"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -13,9 +15,15 @@ import (
 	nativeEddsa "github.com/consensys/gnark-crypto/signature/eddsa"
 
 	"github.com/consensys/gnark/backend/groth16"
+	cs_bn254 "github.com/consensys/gnark/constraint/bn254"
+	groth16_bn254 "github.com/consensys/gnark/backend/groth16/bn254"
+	// "github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 
+	// "github.com/consensys/gnark/backend/witness"
+
+	"flag"
 	"gnarking/circuit"
 )
 
@@ -30,10 +38,10 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 
 func reportEconomics(N int, proveTime time.Duration) {
 	const (
-		cpuPricePerHour   = 0.05      // $/core-hour
-		minTxUSD          = 0.005     // $ per smallest tx
-		hoursPerDay       = 24
-		daysPerYear       = 365
+		cpuPricePerHour = 0.05  // $/core-hour
+		minTxUSD        = 0.005 // $ per smallest tx
+		hoursPerDay     = 24
+		daysPerYear     = 365
 	)
 	cores := runtime.NumCPU()
 
@@ -68,8 +76,8 @@ func reportEconomics(N int, proveTime time.Duration) {
 func reportCompression(proofBytes int64) {
 	feBytes := len(ecc.BN254.ScalarField().Bytes()) // 32 bytes on BN254
 
-	sigBytes := 3 * feBytes         // R.X, R.Y, S
-	preimageFields := 4             // Recipient, Size, Nonce, ChainID
+	sigBytes := 3 * feBytes // R.X, R.Y, S
+	preimageFields := 4     // Recipient, Size, Nonce, ChainID
 	tuplePerTxBytes := preimageFields*feBytes + sigBytes
 
 	totalTupleBytes := int64(circuit.N) * int64(tuplePerTxBytes)
@@ -86,105 +94,171 @@ func reportCompression(proofBytes int64) {
 	fmt.Printf("Calldata/proof ratio: %.2fx\n", ratio)
 }
 
+func check(e error) {
+	if e != nil {
+		panic(e)
+	}
+}
+
+func dump(f string, w io.WriterTo) {
+	g, err := os.Create(f)
+	check(err)
+	defer g.Close()
+	_, err = w.WriteTo(g)
+	check(err)
+}
+func read(fName string, r io.ReaderFrom) {
+	f, err := os.Open(fName)
+	check(err)
+	defer f.Close()
+	_, err = r.ReadFrom(f)
+	check(err)
+}
 
 func main() {
-	// 1) Compile the SettlementCircuit
-	var c circuit.SettlementCircuit
-	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &c)
-	if err != nil {
-		panic(err)
+	var (
+		pkName     = fmt.Sprintf("./artifact/pk_%d.groth16", circuit.N)
+		ccsName    = fmt.Sprintf("./artifact/ccs_%d.groth16", circuit.N)
+		vkName     = fmt.Sprintf("./artifact/vk_%d.groth16", circuit.N)
+		proofName  = fmt.Sprintf("./artifact/proof_%d.groth16", circuit.N)
+		publicName = fmt.Sprintf("./artifact/public_name_%d.json", circuit.N)
+	)
+
+	setup := flag.Bool("setup", false, "run circuit setup (compile + generate keys)")
+	prove := flag.Bool("prove", false, "generate a proof using existing proving key")
+	verify := flag.Bool("verify", false, "verify an existing proof")
+	flag.Parse()
+
+	if *setup {
+		fmt.Println("Setting up N = %d", circuit.N)
+		var c circuit.SettlementCircuit
+		ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &c)
+		check(err)
+		pk, vk, err := groth16.Setup(ccs)
+		dump(ccsName, ccs)
+		dump(pkName, pk)
+		dump(vkName, vk)
+		check(err)
+		cw := &countingWriter{}
+		_, err = pk.WriteTo(cw)
+		check(err)
+		fmt.Printf("Proving key size (N = %d) (serialized): %.2f MB (%d bytes)\n", circuit.N, float64(cw.n)/1024/1024, cw.n)
 	}
+	if *prove {
+		// have to init to read ...
+		var (
+			ccs cs_bn254.R1CS
+			pk groth16_bn254.ProvingKey
+		)
+		read(pkName, &pk)
+		read(ccsName, &ccs)
 
-	// 2) Groth16 setup
-	pk, vk, err := groth16.Setup(ccs)
-	if err != nil {
-		panic(err)
-	}
-	cw := &countingWriter{}
-	if _, err := pk.WriteTo(cw); err != nil {
-		panic(err)
-	}
-	fmt.Printf("Proving key size (N = %d) (serialized): %.2f MB (%d bytes)\n", circuit.N, float64(cw.n)/1024/1024, cw.n)
+		// 3) EdDSA keypair on BN254 twisted Edwards
+		priv, err := nativeEddsa.New(te.BN254, rand.Reader)
+		if err != nil {
+			panic(err)
+		}
+		pub := priv.Public()
+		pkBytes := pub.Bytes()
 
-	// 3) EdDSA keypair on BN254 twisted Edwards
-	priv, err := nativeEddsa.New(te.BN254, rand.Reader)
-	if err != nil {
-		panic(err)
-	}
-	pub := priv.Public()
-	pkBytes := pub.Bytes()
+		// 4) Build a valid witness
+		var w circuit.SettlementCircuit
 
-	// 4) Build a valid witness
-	var w circuit.SettlementCircuit
+		recipient := big.NewInt(42)
+		chainID := big.NewInt(1)
+		kOld := big.NewInt(0)
 
-	recipient := big.NewInt(42)
-	chainID := big.NewInt(1)
-	kOld := big.NewInt(0)
+		w.P.Recipient = recipient
+		w.P.ChainID = chainID
+		w.P.KOld = kOld
 
-	w.Recipient = recipient
-	w.ChainID = chainID
-	w.KOld = kOld
+		total := big.NewInt(0)
 
-	total := big.NewInt(0)
+		for i := 0; i < circuit.N; i++ {
+			size := big.NewInt(1)
+			nonce := big.NewInt(int64(i + 1)) // 1,2,...,N
 
-	for i := 0; i < circuit.N; i++ {
-		size := big.NewInt(1)
-		nonce := big.NewInt(int64(i + 1)) // 1,2,...,N
+			w.Size[i] = new(big.Int).Set(size)
+			w.Nonce[i] = new(big.Int).Set(nonce)
 
-		w.Size[i] = new(big.Int).Set(size)
-		w.Nonce[i] = new(big.Int).Set(nonce)
+			// msg_i = MiMC(domainSep, Recipient, Size[i], Nonce[i], ChainID)
+			msgBytes := circuit.MimcMsg(recipient, size, nonce, chainID)
 
-		// msg_i = MiMC(domainSep, Recipient, Size[i], Nonce[i], ChainID)
-		msgBytes := circuit.MimcMsg(recipient, size, nonce, chainID)
+			// sign with EdDSA using MiMC as internal hash
+			sigBytes, err := priv.Sign(msgBytes, bnMimc.NewMiMC())
+			if err != nil {
+				panic(err)
+			}
 
-		// sign with EdDSA using MiMC as internal hash
-		sigBytes, err := priv.Sign(msgBytes, bnMimc.NewMiMC())
+			// assign signature into circuit witness
+			w.Sig[i].Assign(te.BN254, sigBytes)
+
+			total.Add(total, size)
+		}
+
+		w.P.TotalSettle = total
+		w.P.M = big.NewInt(int64(circuit.N)) // last nonce
+		w.P.Pk.Assign(te.BN254, pkBytes)
+
+		// 5) Build full and public witnesses
+		witness, err := frontend.NewWitness(&w, ecc.BN254.ScalarField())
 		if err != nil {
 			panic(err)
 		}
 
-		// assign signature into circuit witness
-		w.Sig[i].Assign(te.BN254, sigBytes)
+		// 6) Prove
+		start := time.Now()
+		proof, err := groth16.Prove(&ccs, &pk, witness)
+		if err != nil {
+			panic(err)
+		}
+		proveTime := time.Since(start)
+		fmt.Printf("Settlement prover took %s\n", proveTime)
 
-		total.Add(total, size)
+		reportEconomics(circuit.N, proveTime)
+
+		dump(proofName, proof)
+		dump(publicName, &w.P)
+	}
+	if *verify {
+		var (
+			proof         groth16_bn254.Proof
+			publicWitness circuit.SettlementCircuitPublic
+			vk            groth16_bn254.VerifyingKey
+		)
+		read(proofName, &proof)
+		read(vkName, &vk)
+		read(publicName, &publicWitness)
+		// create the circuit assignment
+		assignment := &circuit.SettlementCircuit{
+			P: publicWitness,
+		}
+		pubWit, err := frontend.NewWitness(assignment, ecc.BN254.ScalarField(), frontend.PublicOnly())
+		// 7) Verify
+		start := time.Now()
+		if err := groth16.Verify(&proof, &vk, pubWit); err != nil {
+			panic(err)
+		}
+		fmt.Printf("Settlement verifier took %s\n", time.Since(start))
+
+		fmt.Println("Groth16 settlement proof verified ✅")
+
+		vkFile, err := os.Create(fmt.Sprintf("settlement_verifier_%d.sol", circuit.N))
+		if err != nil {
+			panic(err)
+		}
+		defer vkFile.Close()
+
+		if err := vk.ExportSolidity(vkFile); err != nil {
+			panic(err)
+		}
+		fmt.Println("Solidity verifier exported to settlement_verifier.sol")
+
+		cwProof := &countingWriter{}
+		if _, err := proof.WriteTo(cwProof); err != nil {
+			panic(err)
+		}
+		reportCompression(cwProof.n)
 	}
 
-	w.TotalSettle = total
-	w.M = big.NewInt(int64(circuit.N)) // last nonce
-	w.Pk.Assign(te.BN254, pkBytes)
-
-	// 5) Build full and public witnesses
-	witness, err := frontend.NewWitness(&w, ecc.BN254.ScalarField())
-	if err != nil {
-		panic(err)
-	}
-	publicWitness, err := witness.Public()
-	if err != nil {
-		panic(err)
-	}
-
-	// 6) Prove
-	start := time.Now()
-	proof, err := groth16.Prove(ccs, pk, witness)
-	if err != nil {
-		panic(err)
-	}
-	proveTime := time.Since(start)
-	fmt.Printf("Settlement prover took %s\n", proveTime)
-
-	// 7) Verify
-	start = time.Now()
-	if err := groth16.Verify(proof, vk, publicWitness); err != nil {
-		panic(err)
-	}
-	fmt.Printf("Settlement verifier took %s\n", time.Since(start))
-
-	fmt.Println("Groth16 settlement proof verified ✅")
-
-	cwProof := &countingWriter{}
-	if _, err := proof.WriteTo(cwProof); err != nil {
-		panic(err)
-	}
-	reportCompression(cwProof.n)
-	reportEconomics(circuit.N, proveTime)
 }
