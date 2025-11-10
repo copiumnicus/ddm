@@ -1,0 +1,3 @@
+[submodule "gnarking/ddn/lib/forge-std"]
+	path = gnarking/ddn/lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
