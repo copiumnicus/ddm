@@ -2,9 +2,9 @@ use super::{coracle::*, obalance::*, vauth::*, voucher::*};
 use thiserror::Error;
 
 pub struct Engine<Ci, Vi, V, COR, OBR, T0, T1, T2> {
-    pub va: VoucherAuth<Ci, Vi, V, COR, T0, T1>,
-    pub ob: OutstandingBalanceTracker<T2, Ci, OBR>,
-    pub cr: ClientRiskConfig,
+    va: VoucherAuth<Ci, Vi, V, COR, T0, T1>,
+    ob: OutstandingBalanceTracker<T2, Ci, OBR>,
+    cr: ClientRiskConfig,
 }
 
 #[derive(Debug, Error)]
@@ -60,11 +60,14 @@ where
     T1: ClientOracleRead<Ci, Vi, COR>,
     T2: ClientOutstandingBalanceOp<Ci, OBR>,
 {
-    pub async fn accept_session(&self, v: V) -> Result<(), EngineErr> {
-        Ok(self.va.is_auth(&v).await?)
+    pub async fn accept_session(&self, v: &V) -> Result<(), EngineErr> {
+        Ok(self.va.is_auth_start_session(v).await?)
+    }
+    pub async fn accept_query(&self, v: &V) -> Result<(), EngineErr> {
+        Ok(self.va.is_auth_start_query(v).await?)
     }
     /// within a session:
-    pub async fn accept_query(&self, ci: &Ci, aprx_cost: u64) -> Result<QueryCont, EngineErr> {
+    pub async fn query(&self, ci: &Ci, aprx_cost: u64) -> Result<QueryCont, EngineErr> {
         // in order of rate of updates get data to calculate the safe credit for client
         let (ci_collat, ci_sub) = self
             .va
@@ -140,10 +143,11 @@ where
         if let Some(voucher) = mby_mark_spent {
             self.va.vt.b.mark_spent(ci, voucher.nonce()).await?;
             // reduce
+            let atoms = voucher.voucher_atoms();
             self.ob
                 .b
                 .rw_on_client_o_balance(ci, |r| {
-                    *r.outstanding() = r.outstanding().saturating_sub(voucher.voucher_atoms());
+                    *r.outstanding() = r.outstanding().saturating_sub(atoms);
                 })
                 .await?;
         }

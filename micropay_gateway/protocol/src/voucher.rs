@@ -18,10 +18,18 @@ pub trait Voucher<Ci, Vi>: Clone {
 
 pub trait UnspentVouchersOp<Ci, Vi, V: Voucher<Ci, Vi>> {
     /// NOTE: THE UNSPENT VOUCHERS HAVE TO BE ORDERED ASCENDING ORDER BY NONCE
-    async fn rw_on_unspent_vouchers<F, R>(&self, ci: &Ci, f: F) -> Result<R, std::io::Error>
+    fn rw_on_unspent_vouchers<F, R>(
+        &self,
+        ci: &Ci,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<R, std::io::Error>> + Send
     where
         F: FnOnce(&mut ClientUnspentVouchers<V>) -> R;
-    async fn mark_spent(&self, ci: &Ci, nonce: u64) -> Result<(), std::io::Error>;
+    fn mark_spent(
+        &self,
+        ci: &Ci,
+        nonce: u64,
+    ) -> impl std::future::Future<Output = Result<(), std::io::Error>> + Send;
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +50,21 @@ pub struct UnspentVoucherTracker<Ci, Vi, V, T> {
 impl<Ci, Vi, V: Voucher<Ci, Vi>, T: UnspentVouchersOp<Ci, Vi, V>>
     UnspentVoucherTracker<Ci, Vi, V, T>
 {
+    /// first_unspent <= v.nonce() <= last+1
+    /// using self. to just bind the generics...
+    pub(crate) fn is_unspent_nonce_range(&self, v: &V, r: &ClientUnspentVouchers<V>) -> bool {
+        if r.unspent_vouchers.len() > 0 {
+            let first = &r.unspent_vouchers[0];
+            if v.nonce() < first.nonce() {
+                return false;
+            }
+            let last = &r.unspent_vouchers[r.unspent_vouchers.len() - 1];
+            if v.nonce() > (last.nonce() + 1) {
+                return false;
+            }
+        }
+        true
+    }
     pub fn new(b: T) -> Self {
         Self {
             b,
@@ -49,31 +72,5 @@ impl<Ci, Vi, V: Voucher<Ci, Vi>, T: UnspentVouchersOp<Ci, Vi, V>>
             _vi: PhantomData,
             _v: PhantomData,
         }
-    }
-
-    pub async fn last_known_nonce(&self, ci: &Ci) -> Result<Option<u64>, std::io::Error> {
-        self.b
-            .rw_on_unspent_vouchers(ci, |v| v.last_known_nonce.clone())
-            .await
-    }
-    /// returns true if successful inserting
-    /// new voucher can only be last_known_global_nonce_for_vendor+1
-    pub async fn insert_voucher(&self, v: V) -> Result<bool, std::io::Error> {
-        self.b
-            .rw_on_unspent_vouchers(&v.client_identifier(), |r| {
-                // to prevent race conditions:
-                if let Some(ln) = &r.last_known_nonce {
-                    if v.nonce() != (ln + 1) {
-                        return false;
-                    }
-                } else if v.nonce() != 0 {
-                    return false;
-                }
-                // with checks out of the way:
-                r.last_known_nonce = Some(v.nonce());
-                r.unspent_vouchers.push(v);
-                true
-            })
-            .await
     }
 }

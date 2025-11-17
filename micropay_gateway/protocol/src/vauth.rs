@@ -5,11 +5,23 @@ use thiserror::Error;
 
 /// Answers the question:
 /// Given the client voucher, are we willing to continue processing the request?
+/// Vouchers are both authentication and payment.
+///
+/// The voucher is valid if:
+/// - insert voucher if next in seq
+/// STATIC:
+/// - the voucher sig is valid
+/// - the voucher is in the name of the vendor
+/// VOLATILE:
+/// - the voucher is unspent (subject to change based on usage)
+/// - the client is subscribed to vendor (subject to change based on client changes)
+/// - the client collateral is >= voucher size
+///     (subject to change on client withdrawing or settling against other vendors)
 pub struct VoucherAuth<Ci, Vi, V, COR, T0, T1> {
     pub vt: UnspentVoucherTracker<Ci, Vi, V, T0>,
     pub o: ClientOracle<Ci, Vi, COR, T1>,
     /// the identity of this vendor
-    pub vendor: Vi,
+    vendor: Vi,
 }
 
 impl<Ci, Vi: Eq, V: Voucher<Ci, Vi>, COR: ClientOracleRecord<Vi>, T0, T1>
@@ -25,90 +37,64 @@ where
     ) -> Self {
         Self { vendor, o, vt }
     }
-    /// Vouchers are both authentication and payment.
-    /// The voucher is valid if:
-    /// - insert voucher if next in seq
-    /// STATIC:
-    /// - the voucher sig is valid
-    /// - the voucher is in the name of the vendor
-    /// VOLATILE:
-    /// - the voucher is unspent (subject to change based on usage)
-    /// - the client is subscribed to vendor (subject to change based on client changes)
-    /// - the client collateral is >= voucher size
-    ///     (subject to change on client withdrawing or settling against other vendors)
-    pub async fn is_auth(&self, v: &V) -> Result<(), VAuthErr> {
-        self.is_auth_static(v).await?;
-        self.is_auth_volatile(v).await?;
 
-        let mby_voucher_nonce = self.vt.last_known_nonce(&v.client_identifier()).await?;
-        // finally if voucher is new
-        match mby_voucher_nonce {
-            Some(ln) => {
-                if v.nonce() > (ln + 1) {
-                    // not increasing by 1
-                    return Err(VAuthErr::InvalidNonce {
-                        signed_voucher: v.nonce(),
-                        last_known_voucher: ln,
-                    });
+    /// assert auth and start session (whenever new voucher is seen or changed)
+    /// insert voucher if new
+    pub async fn is_auth_start_session(&self, v: &V) -> Result<(), VAuthErr> {
+        self.is_auth_static(v)?;
+        self.check_oracle(v).await?;
+        self.vt
+            .b
+            .rw_on_unspent_vouchers(&v.client_identifier(), |r| {
+                if !self.vt.is_unspent_nonce_range(v, r) {
+                    return Err(VAuthErr::VoucherSpentOrNonceTooHigh);
                 }
-                if v.nonce() == (ln + 1) {
-                    // insert new
-                    if !self.vt.insert_voucher(v.clone()).await? {
-                        return Err(VAuthErr::NewVoucherRace);
+                // figure out if need to insert new
+                match r.last_known_nonce {
+                    Some(ln) => {
+                        if v.nonce() == (ln + 1) {
+                            // need to insert new voucher
+                            r.last_known_nonce = Some(v.nonce());
+                            r.unspent_vouchers.push(v.clone());
+                        }
+                    }
+                    None => {
+                        if v.nonce() != 0 {
+                            return Err(VAuthErr::FirstVoucherNonceInvalid);
+                        }
+                        // need to insert first ever voucher
+                        r.last_known_nonce = Some(v.nonce());
+                        r.unspent_vouchers.push(v.clone());
                     }
                 }
-            }
-            // no
-            None => {
-                if v.nonce() != 0 {
-                    return Err(VAuthErr::FirstVoucherNonceInvalid);
-                }
-                if !self.vt.insert_voucher(v.clone()).await? {
-                    return Err(VAuthErr::NewVoucherRace);
-                }
-            }
-        }
-
+                Ok(())
+            })
+            .await??;
         Ok(())
     }
 
-    /// Called whenever new voucher is seen.
-    pub async fn is_auth_static(&self, v: &V) -> Result<(), StaticVAuthErr> {
-        if !v.is_valid_signature() {
-            return Err(StaticVAuthErr::InvalidSig);
-        }
-        if v.voucher_atoms() == 0 {
-            return Err(StaticVAuthErr::VoucherHasZeroAtoms);
-        }
-        let vi = v.vendor_identifier();
-        if vi != self.vendor {
-            // the vendor is different
-            return Err(StaticVAuthErr::InvalidVendor);
-        }
-        // static part true
-        Ok(())
-    }
-
-    /// Called on each packet from client (since the env can change)
-    pub async fn is_auth_volatile(&self, v: &V) -> Result<(), VolatileVAuthErr> {
-        let ci = v.client_identifier();
-        let mby_first_unspent = self
-            .vt
+    /// check volatile parts of the voucher
+    pub async fn is_auth_start_query(&self, v: &V) -> Result<(), VAuthErr> {
+        self.is_auth_static(v)?;
+        self.check_oracle(v).await?;
+        // within the session just check if the provided voucher is still unspent
+        self.vt
             .b
-            .rw_on_unspent_vouchers(&ci, |r| r.unspent_vouchers.first().map(|x| x.nonce()))
-            .await?;
-        if let Some(first_unspent) = mby_first_unspent {
-            if first_unspent > v.nonce() {
-                // `v` is not redeemable or used up
-                return Err(VolatileVAuthErr::VoucherUsedUp);
-            }
-        }
-        let vi = v.vendor_identifier();
+            .rw_on_unspent_vouchers(&v.client_identifier(), |r| {
+                if !self.vt.is_unspent_nonce_range(v, r) {
+                    return Err(VAuthErr::VoucherSpentOrNonceTooHigh);
+                }
+                Ok(())
+            })
+            .await??;
+        Ok(())
+    }
 
+    async fn check_oracle(&self, v: &V) -> Result<(), VAuthErr> {
         self.o
             .b
-            .r_on_client_oracle(&ci, |r| {
-                if !r.is_subscribed(&vi) {
+            .r_on_client_oracle(&v.client_identifier(), |r| {
+                if !r.is_subscribed(&self.vendor) {
                     return Err(VolatileVAuthErr::ClientIsNotSubscribed);
                 }
                 let collat = r.collateral();
@@ -123,14 +109,31 @@ where
                 Ok(())
             })
             .await??; // notice unwrap both errs
+        Ok(())
+    }
 
-        // volatile part true
+    /// Called whenever new voucher is seen.
+    fn is_auth_static(&self, v: &V) -> Result<(), StaticVAuthErr> {
+        if !v.is_valid_signature() {
+            return Err(StaticVAuthErr::InvalidSig);
+        }
+        if v.voucher_atoms() == 0 {
+            return Err(StaticVAuthErr::VoucherHasZeroAtoms);
+        }
+        let vi = v.vendor_identifier();
+        if vi != self.vendor {
+            // the vendor is different
+            return Err(StaticVAuthErr::InvalidVendor);
+        }
+        // static part true
         Ok(())
     }
 }
 
 #[derive(Debug, Error)]
 pub enum VAuthErr {
+    #[error("Voucher is either spent or nonce is higher than last_known_nonce+1")]
+    VoucherSpentOrNonceTooHigh,
     #[error("Race err when inserting voucher")]
     NewVoucherRace,
     #[error("IO {0}")]

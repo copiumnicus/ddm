@@ -8,7 +8,11 @@ pub trait ClientOracleRecord<VendorId> {
 }
 
 pub trait ClientOracleRead<Ci, Vi, COR: ClientOracleRecord<Vi>> {
-    async fn r_on_client_oracle<F, R>(&self, ci: &Ci, f: F) -> Result<R, std::io::Error>
+    fn r_on_client_oracle<F, R>(
+        &self,
+        ci: &Ci,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<R, std::io::Error>> + Send
     where
         F: FnOnce(&COR) -> R;
 }
