@@ -1,118 +1,153 @@
-use crate::{ctrack::*, traits::*, vauth::*};
-use std::time::Instant;
+use super::{coracle::*, obalance::*, vauth::*, voucher::*};
 use thiserror::Error;
 
-/// 1. Get user req
-/// 2. Check if voucher valid
-///
-/// 3. Check if user_credit > aprx_cost_of_query
-/// 4. reserve(aprx_cost_of_query)
-/// 5. Process query OR Deny query
-/// 5. Subtract (ret_data_len*data_price + time*compute_price)
-/// 6. Send status of credits AND (result of query OR notice for new voucher)
-///
-/// Rolling, on per second basis charge for connection + check risk
-pub struct Engine<V, U, K> {
-    pub va: VoucherAuth<V, U, K>,
-    pub ct: CreditTrack<V, U, K>,
-}
-
-#[derive(Debug)]
-pub struct QueryCont {
-    pub start: Instant,
-    pub case: QueryCase,
-}
-
-#[derive(Debug)]
-pub enum QueryCase {
-    Reject {
-        aprx_cost: u64,
-        uc: UserCredit,
-    },
-    /// we lock the approx cost of query so user can't parallel call for the same atoms
-    Continue {
-        locked_cost: u64,
-    },
-}
-
-#[derive(Debug)]
-pub struct SettleQuery {
-    /// per hour
-    pub hour_price: f64,
-    pub data_bytes: u64,
-    /// per GB
-    pub gb_price: f64,
-}
-const HOUR_SEC: f64 = 60.0 * 60.0;
-const GB_BYTES: f64 = 8.0 * 1e9;
-
-impl SettleQuery {
-    pub fn cost(&self, start: Instant) -> u64 {
-        let hour = start.elapsed().as_secs_f64() / HOUR_SEC;
-        let giga_bytes = self.data_bytes as f64 / GB_BYTES;
-        let v = (hour * self.hour_price) + (giga_bytes * self.gb_price);
-        v as u64
-    }
-}
-
-#[derive(Debug)]
-pub struct CreditStatus {
-    pub uc: UserCredit,
-    pub sq: SettleQuery,
+pub struct Engine<Ci, Vi, V, COR, OBR, T0, T1, T2> {
+    pub va: VoucherAuth<Ci, Vi, V, COR, T0, T1>,
+    pub ob: OutstandingBalanceTracker<T2, Ci, OBR>,
+    pub cr: ClientRiskConfig,
 }
 
 #[derive(Debug, Error)]
 pub enum EngineErr {
     #[error("Auth {0}")]
     VAuth(#[from] VAuthErr),
-    #[error("Oracle {0}")]
-    Oracle(#[from] OracleErr),
-    #[error("VTrack {0}")]
-    VTrack(#[from] VTrackErr),
+    #[error("IO {0}")]
+    IO(#[from] std::io::Error),
 }
 
-impl<V: Voucher<U, K>, U, K: Eq> Engine<V, U, K> {
-    pub fn accept_session(&self, v: V) -> Result<(), EngineErr> {
-        Ok(self.va.is_auth(&v)?)
-    }
-    pub fn accept_query(&self, ci: U, aprx_cost: u64) -> Result<QueryCont, EngineErr> {
-        let uc = self.ct.user_credit(&ci)?;
-        let start = Instant::now();
-        if aprx_cost > uc.available() {
-            return Ok(QueryCont {
-                start,
-                case: QueryCase::Reject { aprx_cost, uc },
-            });
+#[derive(Debug)]
+pub struct QueryCont {
+    /// we lock the approx cost of query so user can't parallel call for the same atoms
+    locked_cost: u64,
+    /// if the cost checks passed and should continue
+    pub should_continue: bool,
+}
+/// accounts for the client burst subscribing to 5 new vendors
+pub const DEFAULT_VENDOR_CLIENT_EXPAND_RISK: u64 = 5;
+pub struct ClientRiskConfig {
+    vendor_client_expand_risk: u64,
+}
+
+impl ClientRiskConfig {
+    pub fn new(vendor_client_expand_risk: Option<u64>) -> Self {
+        Self {
+            vendor_client_expand_risk: vendor_client_expand_risk
+                .unwrap_or(DEFAULT_VENDOR_CLIENT_EXPAND_RISK),
         }
-        self.ct.u.lock(&ci, aprx_cost);
-        Ok(QueryCont {
-            start,
-            case: QueryCase::Continue {
-                locked_cost: aprx_cost,
-            },
-        })
     }
-    pub fn settle_query(
+    pub fn get_client_risk_adj_collateral(&self, ci_collateral: u64, ci_subscriptions: u64) -> u64 {
+        let sm = ci_subscriptions + self.vendor_client_expand_risk;
+        if sm == 0 {
+            return ci_collateral;
+        }
+        let unspent_per_vendor_safe = ci_collateral / sm;
+        unspent_per_vendor_safe
+    }
+}
+
+impl<
+    Ci,
+    Vi: Eq,
+    V: Voucher<Ci, Vi>,
+    COR: ClientOracleRecord<Vi>,
+    OBR: OutstandingBalanceRecord,
+    T0,
+    T1,
+    T2,
+> Engine<Ci, Vi, V, COR, OBR, T0, T1, T2>
+where
+    T0: UnspentVouchersOp<Ci, Vi, V>,
+    T1: ClientOracleRead<Ci, Vi, COR>,
+    T2: ClientOutstandingBalanceOp<Ci, OBR>,
+{
+    pub async fn accept_session(&self, v: V) -> Result<(), EngineErr> {
+        Ok(self.va.is_auth(&v).await?)
+    }
+    /// within a session:
+    pub async fn accept_query(&self, ci: &Ci, aprx_cost: u64) -> Result<QueryCont, EngineErr> {
+        // in order of rate of updates get data to calculate the safe credit for client
+        let (ci_collat, ci_sub) = self
+            .va
+            .o
+            .b
+            .r_on_client_oracle(ci, |x| (x.collateral(), x.subscriptions()))
+            .await?;
+        // oracle guided amt that client can spend that we can settle in reasonable time without them withdrawing
+        // or spending somewhere else
+        let safe_cap = self.cr.get_client_risk_adj_collateral(ci_collat, ci_sub);
+        let unspent: u64 = self
+            .va
+            .vt
+            .b
+            .rw_on_unspent_vouchers(ci, |x| {
+                x.unspent_vouchers.iter().map(|x| x.voucher_atoms()).sum()
+            })
+            .await?;
+
+        let mut qc = QueryCont {
+            locked_cost: 0,
+            should_continue: false,
+        };
+        self.ob
+            .b
+            .rw_on_client_o_balance(ci, |r| {
+                let safe_avb = unspent
+                    .saturating_sub(*r.outstanding())
+                    .saturating_sub(*r.lock_value())
+                    .min(safe_cap);
+                if aprx_cost > safe_avb {
+                    return Ok(qc);
+                }
+                *r.lock_value() += aprx_cost;
+                qc.locked_cost = aprx_cost;
+                qc.should_continue = true;
+                Ok(qc)
+            })
+            .await?
+    }
+    pub async fn settle_query(
         &self,
-        ci: &U,
+        ci: &Ci,
         q: &QueryCont,
-        sq: SettleQuery,
-    ) -> Result<CreditStatus, EngineErr> {
-        let cost = sq.cost(q.start);
-        match q.case {
-            QueryCase::Reject { .. } => {}
-            QueryCase::Continue { locked_cost } => {
-                self.ct.u.unlock(ci, locked_cost);
-            }
+        actual_cost: u64,
+    ) -> Result<(), EngineErr> {
+        if !q.should_continue {
+            return Ok(());
         }
-        self.ct.u.add_cost(ci, cost);
-        let first_unspent = self.va.vt.get_first_unspent_voucher(ci)?;
-        let fa = first_unspent.voucher_atoms();
-        if self.ct.u.unmarked_cost(ci) > fa {
-            self.ct.vt.mark_spent(ci, first_unspent.nonce());
-            self.ct.u.reduce(ci, fa);
+        let outstanding_bal = self
+            .ob
+            .b
+            .rw_on_client_o_balance(ci, |x| {
+                *x.outstanding() += actual_cost;
+                *x.lock_value() = x.lock_value().saturating_sub(q.locked_cost);
+                *x.outstanding()
+            })
+            .await?;
+        let mby_mark_spent = self
+            .va
+            .vt
+            .b
+            .rw_on_unspent_vouchers(ci, |r| {
+                if let Some(first_unspent) = r.unspent_vouchers.first() {
+                    if outstanding_bal >= first_unspent.voucher_atoms() {
+                        return Some(first_unspent.clone());
+                    }
+                }
+                None
+            })
+            .await?;
+
+        if let Some(voucher) = mby_mark_spent {
+            self.va.vt.b.mark_spent(ci, voucher.nonce()).await?;
+            // reduce
+            self.ob
+                .b
+                .rw_on_client_o_balance(ci, |r| {
+                    *r.outstanding() = r.outstanding().saturating_sub(voucher.voucher_atoms());
+                })
+                .await?;
         }
-        let uc = self.ct.user_credit(ci)?;
-        Ok(CreditStatus { uc, sq })
+
+        Ok(())
     }
 }
