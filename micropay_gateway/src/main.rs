@@ -1,9 +1,14 @@
+use std::collections::HashSet;
+use std::io::ErrorKind;
+
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const LISTEN_ADDR: &str = "0.0.0.0:5433"; // where clients connect
 const BACKEND_ADDR: &str = "127.0.0.1:5432"; // real postgres
 
+/// application_name=init_voucher; (strip app_name in msg, set to 'psql')
+/// set voucher = next_voucher; (strip set from sql, update voucher)
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
@@ -21,101 +26,116 @@ async fn main() -> io::Result<()> {
     }
 }
 
-async fn handle_conn(mut client: TcpStream) -> io::Result<()> {
-    // ---- 1) Read startup packet from client ----
-    let mut len_buf = [0u8; 4];
-    client.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf);
-
-    if len < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("startup length too small: {len}"),
-        ));
-    }
-
-    let body_len = len - 4;
-    let mut body = vec![0u8; body_len as usize];
-    client.read_exact(&mut body).await?;
-
-    // ---- 2) Parse protocol + params (StartupMessage) ----
-    let protocol = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-    println!("startup protocol: 0x{protocol:08x}");
-
-    // If you accidentally have SSL on, you'll see this magic:
-    // 0x04d2162f (80877103) which is SSLRequest.
-    if protocol == 0x04d2162f {
-        println!("SSLRequest detected. This simple proxy assumes sslmode=disable.");
-        // For now, just bail out nicely:
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "SSLRequest not supported in this minimal proxy (use sslmode=disable)",
-        ));
-    }
-
-    // parse key\0value\0 pairs
-    // ex:
-    // user\0testuser\0
-    // database\0testdb\0
-    // application_name\0psql\0
-    // client_encoding\0UTF8\0
-    // \0
-
-    let mut params = Vec::new();
-    let mut i = 4; // we already consumed protocol (first 4 bytes of body)
-    while i < body.len() {
-        // key
-        let key_start = i;
-        while i < body.len() && body[i] != 0 {
-            i += 1;
-        }
-        if i == key_start {
-            // empty key -> terminator
-            break;
-        }
-        let key = String::from_utf8_lossy(&body[key_start..i]).into_owned();
-        i += 1; // skip null
-
-        // value
-        let val_start = i;
-        while i < body.len() && body[i] != 0 {
-            i += 1;
-        }
-        let value = String::from_utf8_lossy(&body[val_start..i]).into_owned();
-        i += 1; // skip null
-
-        params.push((key, value));
-    }
-
-    println!("startup params:");
-    for (k, v) in &params {
-        println!("  {k} = {v}");
-    }
-
-    // ----- here is where you'd later inspect/gate on user/app_name/voucher ----
-    // e.g. find application_name, parse voucher prefix, etc.
-
-    // ---- 3) Connect to real Postgres ----
-    let mut server = TcpStream::connect(BACKEND_ADDR).await?;
-    println!("connected to backend {BACKEND_ADDR}");
-
-    // ---- 4) Forward the same startup packet to Postgres ----
-    server.write_all(&len_buf).await?;
-    server.write_all(&body).await?;
-    server.flush().await?;
-
-    // ---- 5) From here on: just raw bidirectional forwarding ----
-    let (bytes_c2s, bytes_s2c) = io::copy_bidirectional(&mut client, &mut server).await?;
-    println!("connection closed, bytes client->server: {bytes_c2s}, server->client: {bytes_s2c}");
-
-    Ok(())
-}
-
 async fn handle_conn2(mut client: TcpStream) -> io::Result<()> {
     let mut server = TcpStream::connect(BACKEND_ADDR).await?;
     println!("connected to backend {BACKEND_ADDR}");
     logged_copy_bidirectional(client, server).await?;
     Ok(())
+}
+
+mod startup {
+    use std::io::{self, ErrorKind};
+    /// Parse a PostgreSQL StartupMessage from `buf[..n]`.
+    /// Returns (protocol_version, Vec<(key, value)>).
+    ///
+    /// StartupMessage wire format:
+    ///   Int32 length                (includes this Int32, excludes no type byte)
+    ///   Int32 protocol_version      (usually 0x00030000)
+    ///   key\0value\0...key\0value\0\0
+    ///
+    /// NOTE: StartupMessage has *no* type byte.
+    pub fn parse_startup_message(
+        buf: &[u8],
+        n: usize,
+    ) -> Result<(u32, Vec<(String, String)>), io::Error> {
+        use std::io::Error;
+        if n < 8 {
+            return Err(Error::new(ErrorKind::Other, "startup message too short"));
+        }
+
+        // --- Decode message length ---
+        let len = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        if len as usize != n {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("startup length mismatch: header says {len}, got {n} bytes"),
+            ));
+        }
+
+        // --- Decode protocol version ---
+        let protocol = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+
+        // --- Parse key/value pairs ---
+        let mut params = Vec::new();
+        let mut i = 8; // skip length + protocol
+
+        while i < n {
+            // find key (null-terminated)
+            let key_start = i;
+            while i < n && buf[i] != 0 {
+                i += 1;
+            }
+            if i >= n {
+                return Err(Error::new(ErrorKind::Other, "unterminated key"));
+            }
+
+            // empty key means terminator
+            if i == key_start {
+                break;
+            }
+
+            let key = String::from_utf8_lossy(&buf[key_start..i]).to_string();
+            i += 1; // skip NUL
+
+            // find value
+            let val_start = i;
+            while i < n && buf[i] != 0 {
+                i += 1;
+            }
+            if i >= n {
+                return Err(Error::new(ErrorKind::Other, "unterminated value"));
+            }
+
+            let val = String::from_utf8_lossy(&buf[val_start..i]).to_string();
+            i += 1; // skip NUL
+
+            params.push((key, val));
+        }
+
+        Ok((protocol, params))
+    }
+    /// Build a PostgreSQL StartupMessage from:
+    ///   - protocol_version (usually 0x00030000)
+    ///   - list of (key, value) pairs
+    ///
+    /// Returns a Vec<u8> ready to send over TCP.
+    /// This message has *no* type byte; the first field is Int32 length.
+    pub fn build_startup_message(protocol_version: u32, params: &[(String, String)]) -> Vec<u8> {
+        let mut body = Vec::new();
+
+        // protocol version
+        body.extend_from_slice(&protocol_version.to_be_bytes());
+
+        // key/value pairs
+        for (k, v) in params {
+            body.extend_from_slice(k.as_bytes());
+            body.push(0);
+            body.extend_from_slice(v.as_bytes());
+            body.push(0);
+        }
+
+        // terminator
+        body.push(0);
+
+        // length = body.len() + 4 (for length field itself)
+        let total_len = (body.len() + 4) as u32;
+
+        let mut msg = Vec::with_capacity(body.len() + 4);
+        msg.extend_from_slice(&total_len.to_be_bytes());
+        msg.extend_from_slice(&body);
+
+        msg
+    }
 }
 
 /// Pumps bytes both ways with logging.
@@ -127,34 +147,42 @@ pub async fn logged_copy_bidirectional(
     let (mut cr, mut cw) = tokio::io::split(client); // client read/write
     let (mut sr, mut sw) = tokio::io::split(server); // server read/write
 
-    let mut c2s_bytes = 0u64;
-    let mut s2c_bytes = 0u64;
-
-    // ---- TASK: client → server ----
-    let c2s = tokio::spawn(async move {
+    let c2s = {
         let mut buf = [0u8; 8192];
-        let mut total = 0u64;
+        // read startup msg
+        let n = cr.read(&mut buf).await?;
+        let (pver, kv) = startup::parse_startup_message(&buf, n)?;
+        println!("client sent '{} {:?}'", pver, kv);
 
-        loop {
-            let n = match cr.read(&mut buf).await {
-                Ok(0) => break, // client closed
-                Ok(n) => n,
-                Err(e) => return Err(e),
-            };
+        sw.write_all(&buf[..n]).await?;
 
-            // LOG BYTES SENT FROM CLIENT
-            println!("CLIENT → SERVER  ({} bytes): {:02x?}", n, &buf[..n]);
+        // ---- TASK: client → server ----
+        tokio::spawn(async move {
+            let mut total = 0u64;
 
-            total += n as u64;
+            loop {
+                let n = match cr.read(&mut buf).await {
+                    Ok(0) => break, // client closed
+                    Ok(n) => n,
+                    Err(e) => return Err(e),
+                };
 
-            if let Err(e) = sw.write_all(&buf[..n]).await {
-                return Err(e);
+                // LOG BYTES SENT FROM CLIENT
+                println!(
+                    "CLIENT → SERVER  ({} bytes): {:02x?}",
+                    n,
+                    &String::from_utf8_lossy(&buf[..n])
+                );
+
+                total += n as u64;
+
+                sw.write_all(&buf[..n]).await?;
             }
-        }
 
-        let _ = sw.shutdown().await;
-        Ok(total)
-    });
+            let _ = sw.shutdown().await;
+            Ok(total)
+        })
+    };
 
     // ---- TASK: server → client ----
     let s2c = tokio::spawn(async move {
@@ -169,13 +197,15 @@ pub async fn logged_copy_bidirectional(
             };
 
             // LOG BYTES SENT FROM SERVER
-            println!("SERVER → CLIENT  ({} bytes): {:02x?}", n, &buf[..n]);
+            println!(
+                "SERVER → CLIENT  ({} bytes): {:02x?}",
+                n,
+                &String::from_utf8_lossy(&buf[..n])
+            );
 
             total += n as u64;
 
-            if let Err(e) = cw.write_all(&buf[..n]).await {
-                return Err(e);
-            }
+            cw.write_all(&buf[..n]).await?;
         }
 
         let _ = cw.shutdown().await;
