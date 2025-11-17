@@ -50,6 +50,7 @@ pub enum VTrackErr {
     #[error("Failed to retrieve vouchers")]
     InternalFailure,
 }
+
 /// has to track the current unmarked cost for user
 /// if the unmarked_cost > first_unspent_voucher.atoms
 /// we can mark the unspent voucher as spent and reduce unmarked cost
