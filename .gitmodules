@@ -1,3 +1,10 @@
 [submodule "gnarking/ddn/lib/forge-std"]
 	path = gnarking/ddn/lib/forge-std
 	url = https://github.com/foundry-rs/forge-std
+
+[submodule "coproc/contracts/lib/forge-std"]
+	path = coproc/contracts/lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "coproc/contracts/lib/sp1-contracts"]
+	path = coproc/contracts/lib/sp1-contracts
+	url = https://github.com/succinctlabs/sp1-contracts
