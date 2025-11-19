@@ -16,6 +16,12 @@ pub trait Voucher<Ci, Vi>: Clone {
     fn vendor_identifier(&self) -> Vi;
 }
 
+/// NEEDS TO STORE NEW VOUCHERS IN DB
+/// For storing in db this is good as we can keep only the few unspent vouchers in mem while all others are archived
+/// For retrieval we only need to know the spent voucher nonce which is also stored.
+/// All vouchers:
+/// [V, V, V, V, unspent(V, V, V, V, V)] (ordered nonce asc)
+/// unspent_nonce=x
 pub trait UnspentVouchersOp<Ci, Vi, V: Voucher<Ci, Vi>> {
     /// NOTE: THE UNSPENT VOUCHERS HAVE TO BE ORDERED ASCENDING ORDER BY NONCE
     fn rw_on_unspent_vouchers<F, R>(
@@ -24,20 +30,39 @@ pub trait UnspentVouchersOp<Ci, Vi, V: Voucher<Ci, Vi>> {
         f: F,
     ) -> impl std::future::Future<Output = Result<R, std::io::Error>> + Send
     where
-        F: FnOnce(&mut ClientUnspentVouchers<V>) -> R;
-    fn mark_spent(
-        &self,
-        ci: &Ci,
-        nonce: u64,
-    ) -> impl std::future::Future<Output = Result<(), std::io::Error>> + Send;
+        F: FnOnce(&mut ClientUnspentVouchers<Ci, Vi, V>) -> R;
 }
 
 #[derive(Debug, Clone)]
-pub struct ClientUnspentVouchers<V> {
+pub struct ClientUnspentVouchers<Ci, Vi, V> {
+    /// only a temporary buffer when we move unspent_vouchers to spent vouchers
+    /// (to not delete data from ds, only show where it is supposed to go)
+    /// spent vouchers should be flushed away and emptied to db
+    pub spent_vouchers: Vec<V>,
     /// Only vouchers that were not spent yet by the client
     pub unspent_vouchers: Vec<V>,
     /// None if this client has never been interacted with
     pub last_known_nonce: Option<u64>,
+
+    pub _ci: PhantomData<Ci>,
+    pub _vi: PhantomData<Vi>,
+}
+
+impl<Ci, Vi, V: Voucher<Ci, Vi>> ClientUnspentVouchers<Ci, Vi, V> {
+    /// first_unspent <= v.nonce() <= last+1
+    pub(crate) fn is_unspent_nonce_range(&self, v: &V) -> bool {
+        if self.unspent_vouchers.len() > 0 {
+            let first = &self.unspent_vouchers[0];
+            if v.nonce() < first.nonce() {
+                return false;
+            }
+            let last = &self.unspent_vouchers[self.unspent_vouchers.len() - 1];
+            if v.nonce() > (last.nonce() + 1) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 pub struct UnspentVoucherTracker<Ci, Vi, V, T> {
@@ -47,24 +72,7 @@ pub struct UnspentVoucherTracker<Ci, Vi, V, T> {
     _v: PhantomData<V>,
 }
 
-impl<Ci, Vi, V: Voucher<Ci, Vi>, T: UnspentVouchersOp<Ci, Vi, V>>
-    UnspentVoucherTracker<Ci, Vi, V, T>
-{
-    /// first_unspent <= v.nonce() <= last+1
-    /// using self. to just bind the generics...
-    pub(crate) fn is_unspent_nonce_range(&self, v: &V, r: &ClientUnspentVouchers<V>) -> bool {
-        if r.unspent_vouchers.len() > 0 {
-            let first = &r.unspent_vouchers[0];
-            if v.nonce() < first.nonce() {
-                return false;
-            }
-            let last = &r.unspent_vouchers[r.unspent_vouchers.len() - 1];
-            if v.nonce() > (last.nonce() + 1) {
-                return false;
-            }
-        }
-        true
-    }
+impl<Ci, Vi, V, T> UnspentVoucherTracker<Ci, Vi, V, T> {
     pub fn new(b: T) -> Self {
         Self {
             b,

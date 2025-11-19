@@ -21,7 +21,7 @@ pub struct VoucherAuth<Ci, Vi, V, COR, T0, T1> {
     pub vt: UnspentVoucherTracker<Ci, Vi, V, T0>,
     pub o: ClientOracle<Ci, Vi, COR, T1>,
     /// the identity of this vendor
-    vendor: Vi,
+    pub(crate) vendor: Vi,
 }
 
 impl<Ci, Vi: Eq, V: Voucher<Ci, Vi>, COR: ClientOracleRecord<Vi>, T0, T1>
@@ -40,13 +40,20 @@ where
 
     /// assert auth and start session (whenever new voucher is seen or changed)
     /// insert voucher if new
-    pub async fn is_auth_start_session(&self, v: &V) -> Result<(), VAuthErr> {
+    pub async fn is_auth_start_session(
+        &self,
+        v: &V,
+        min_voucher_size: u64,
+    ) -> Result<(), VAuthErr> {
         self.is_auth_static(v)?;
+        if v.voucher_atoms() < min_voucher_size {
+            return Err(VAuthErr::BelowMinVoucher(min_voucher_size));
+        }
         self.check_oracle(v).await?;
         self.vt
             .b
             .rw_on_unspent_vouchers(&v.client_identifier(), |r| {
-                if !self.vt.is_unspent_nonce_range(v, r) {
+                if !r.is_unspent_nonce_range(v) {
                     return Err(VAuthErr::VoucherSpentOrNonceTooHigh);
                 }
                 // figure out if need to insert new
@@ -81,7 +88,7 @@ where
         self.vt
             .b
             .rw_on_unspent_vouchers(&v.client_identifier(), |r| {
-                if !self.vt.is_unspent_nonce_range(v, r) {
+                if !r.is_unspent_nonce_range(v) {
                     return Err(VAuthErr::VoucherSpentOrNonceTooHigh);
                 }
                 Ok(())
@@ -94,10 +101,10 @@ where
         self.o
             .b
             .r_on_client_oracle(&v.client_identifier(), |r| {
-                if !r.is_subscribed(&self.vendor) {
+                if !r.is_subscribed_to_be(&self.vendor) {
                     return Err(VolatileVAuthErr::ClientIsNotSubscribed);
                 }
-                let collat = r.collateral();
+                let collat = r.collateral_to_be();
                 let va = v.voucher_atoms();
                 if collat < va {
                     // client can't pay as far as we know
@@ -132,6 +139,8 @@ where
 
 #[derive(Debug, Error)]
 pub enum VAuthErr {
+    #[error("Below min voucher size min_size={0}")]
+    BelowMinVoucher(u64),
     #[error("Voucher is either spent or nonce is higher than last_known_nonce+1")]
     VoucherSpentOrNonceTooHigh,
     #[error("Race err when inserting voucher")]
