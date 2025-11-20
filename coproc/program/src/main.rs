@@ -22,7 +22,7 @@ pub fn main() {
     let r = process_txs(inp);
 
     // Encode the public values of the program.
-    let bytes = PublicValuesStruct::abi_encode(&PublicValuesStruct { n: vec![] });
+    let bytes = PublicValuesStruct::abi_encode(&PublicValuesStruct { n: r });
     // let bytes = vec![];
 
     // Commit to the public values of the program. The final proof will have a commitment to all the

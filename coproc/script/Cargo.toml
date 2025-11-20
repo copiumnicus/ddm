@@ -27,5 +27,11 @@ alloy-sol-types = { workspace = true }
 fibonacci-lib = { path = "../lib" }
 dotenv = "0.15.0"
 
+k256 = { version = "0.13.4", default-features = false, features = [
+    "ecdsa",
+    "std",
+] }
+tiny-keccak = "2.0.2"
+
 [build-dependencies]
 sp1-build = "5.0.8"
