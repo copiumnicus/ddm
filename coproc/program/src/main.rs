@@ -9,17 +9,18 @@
 sp1_zkvm::entrypoint!(main);
 
 use alloy_sol_types::SolType;
-use fibonacci_lib::{process_txs, Input, PublicValuesStruct};
+use fibonacci_lib::{ds::*, process_txs, PublicValuesStruct};
 
 pub fn main() {
     // Read an input to the program.
     //
     // Behind the scenes, this compiles down to a custom system call which handles reading inputs
     // from the prover.
-    let inp = sp1_zkvm::io::read::<Input>();
+    let inp = sp1_zkvm::io::read_vec();
     // let inp = deserialize::<Input, Error>(&input).unwrap();
-    // Compute the n'th fibonacci number using a function from the workspace lib crate.
-    let r = process_txs(inp);
+
+    // program gets some weird 8 bytes lead on the input
+    let r = process_txs(&inp[8..]);
 
     // Encode the public values of the program.
     let bytes = PublicValuesStruct::abi_encode(&PublicValuesStruct { n: r });

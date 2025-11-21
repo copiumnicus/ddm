@@ -1,24 +1,20 @@
-//! An end-to-end example of using the SP1 SDK to generate a proof of a program that can be executed
-//! or have a core proof generated.
-//!
-//! You can run this script using the following command:
-//! ```shell
-//! RUST_LOG=info cargo run --release -- --execute
-//! ```
-//! or
-//! ```shell
-//! RUST_LOG=info cargo run --release -- --prove
-//! ```
-
 use alloy_sol_types::SolType;
 use clap::Parser;
-use fibonacci_lib::{Input, PublicValuesStruct, Sig};
+use fibonacci_lib::{
+    ds::{InputToSer, TxToSer},
+    PublicValuesStruct,
+};
 use k256::{
     ecdsa::{RecoveryId, SigningKey, VerifyingKey},
-    elliptic_curve::{rand_core, sec1::ToEncodedPoint, FieldBytes, PublicKey},
+    elliptic_curve::{
+        rand_core::{self, RngCore},
+        sec1::ToEncodedPoint,
+        FieldBytes, PublicKey,
+    },
     Secp256k1,
 };
 use sp1_sdk::{include_elf, ProverClient, SP1Stdin};
+use std::collections::{HashMap, HashSet};
 use tiny_keccak::{Hasher, Keccak};
 
 /// The ELF (executable and linkable format) file for the Succinct RISC-V zkVM.
@@ -58,6 +54,8 @@ fn sk_to_adr(sk: &SigningKey) -> [u8; 20] {
     pubk_to_adr(pubk.as_bytes())
 }
 
+pub type Sig = ([u8; 32], [u8; 32], u8);
+
 fn sign(sk: &SigningKey, hash: [u8; 32]) -> Sig {
     let (sig, recovery_id) = sk.sign_prehash_recoverable(hash.as_ref()).unwrap();
     // Low-S normalize per BIP 0062: Dealing with Malleability:
@@ -79,6 +77,96 @@ fn recover(sig: &Sig, hash: &[u8; 32]) -> [u8; 20] {
     pubk_to_adr(pubk.as_bytes())
 }
 
+struct MockAcc {
+    sk: SigningKey,
+    nonce: u64,
+    addr: [u8; 20],
+}
+
+impl MockAcc {
+    pub fn new() -> Self {
+        let sk = SigningKey::random(&mut rand_core::OsRng);
+        let addr = sk_to_adr(&sk);
+        Self {
+            sk,
+            addr,
+            nonce: rand_core::OsRng.next_u64(),
+        }
+    }
+
+    pub fn signed_tx(&mut self, to: [u8; 20], atoms: i64) -> TxToSer {
+        self.nonce += 1;
+        let mut tx = TxToSer {
+            to,
+            atoms,
+            nonce: self.nonce,
+            sig_r: [0; 32],
+            sig_s: [0; 32],
+            v: 0,
+            from_idx: 0,
+            to_idx: 0,
+        };
+        let digest = tx.keccak();
+        let sig = sign(&self.sk, digest);
+        tx.sig_r = sig.0;
+        tx.sig_s = sig.1;
+        tx.v = sig.2;
+        tx
+    }
+    pub fn tx(&mut self, to: &Self, atoms: i64) -> TxToSer {
+        self.signed_tx(to.addr, atoms)
+    }
+}
+
+fn rec(tx: &TxToSer) -> [u8; 20] {
+    recover(&(tx.sig_r, tx.sig_s, tx.v), &tx.keccak())
+}
+
+struct InputBuilder {
+    fee_atoms: u16,
+    state_deltas: HashSet<[u8; 20]>,
+    fee_recipient: [u8; 20],
+    txs: Vec<TxToSer>,
+}
+impl InputBuilder {
+    pub fn new(fee_atoms: u16, fee_recipient: [u8; 20]) -> Self {
+        Self {
+            fee_atoms,
+            fee_recipient,
+            txs: vec![],
+            state_deltas: HashSet::new(),
+        }
+    }
+    pub fn add(mut self, tx: TxToSer) -> Self {
+        let from = rec(&tx);
+        self.state_deltas.insert(from);
+        self.state_deltas.insert(tx.to);
+        self.txs.push(tx);
+        self
+    }
+    pub fn ser(&self) -> InputToSer {
+        let mut txs = vec![];
+        let idx: HashMap<_, _> = self
+            .state_deltas
+            .iter()
+            .enumerate()
+            .map(|(x, y)| (*y, (x + 1) as u32))
+            .collect();
+        for mut tx in self.txs.clone() {
+            let from = rec(&tx);
+            tx.from_idx = idx[&from];
+            tx.to_idx = idx[&tx.to];
+            txs.push(tx);
+        }
+        InputToSer {
+            fee_atoms: self.fee_atoms,
+            fee_recipient: self.fee_recipient,
+            state_deltas: self.state_deltas.len() as u32 + 1,
+            tx: txs,
+        }
+    }
+}
+
 fn main() {
     // Setup the logger.
     sp1_sdk::utils::setup_logger();
@@ -94,36 +182,28 @@ fn main() {
 
     // Setup the prover client.
 
-    let sk = SigningKey::random(&mut rand_core::OsRng);
-    let addr = sk_to_adr(&sk);
-    println!("addr {:?}", addr);
+    let mut alice = MockAcc::new();
+    let mut bob = MockAcc::new();
+    let mut charlie = MockAcc::new();
 
-    let mut pre = vec![];
-    pre.extend_from_slice(&addr);
-    let digest = keccak256(&pre);
+    let fee_sink = MockAcc::new();
 
-    let sig = sign(&sk, digest);
-    assert!(recover(&sig, &digest) == addr, "sig addr match");
+    let batch = InputBuilder::new(20, fee_sink.addr);
+    let batch = batch
+        .add(alice.tx(&bob, 1000))
+        .add(alice.tx(&bob, 100))
+        .add(alice.tx(&bob, 2000))
+        .add(alice.tx(&charlie, 1000))
+        .add(bob.tx(&alice, 1000))
+        .add(charlie.tx(&bob, 1000));
 
-    // Setup the inputs.
-
-    let mut inp: Input = (
-        2,
-        vec![
-            (addr, [1; 20], 10, 0, 1, sig),
-            // ([0; 20], [2; 20], 15, 0, 2),
-            // ([0; 20], [2; 20], 15, 0, 2),
-        ],
-    );
-    // 220 sec for 6k `tx`
-    // for _ in 0..6000 {
-    //     inp.1.push(([0; 20], [2; 20], 15, 0, 2));
-    // }
     let client = ProverClient::from_env();
     let mut stdin = SP1Stdin::new();
-    stdin.write(&inp);
-
-    println!("n: {}", args.n);
+    let ser = batch.ser();
+    println!("state_deltas={} txs={}", ser.state_deltas, ser.tx.len());
+    let ser = ser.ser();
+    println!("input size: {}", ser.len());
+    stdin.write(&ser);
 
     if args.execute {
         // Execute the program
@@ -133,18 +213,7 @@ fn main() {
         // Read the output.
         let decoded = PublicValuesStruct::abi_decode(output.as_slice()).unwrap();
         let PublicValuesStruct { n } = decoded;
-        println!("{:?}", n);
-        // let a = n[1];
-        // let b = n[2];
-        // let n = n[0];
-        // println!("n: {}", n);
-        // println!("a: {}", a);
-        // println!("b: {}", b);
-
-        // let (expected_a, expected_b) = fibonacci_lib::fibonacci(n);
-        // assert_eq!(a, expected_a);
-        // assert_eq!(b, expected_b);
-        // println!("Values are correct!");
+        println!("{:#?}", n);
 
         // Record the number of cycles executed.
         println!("Number of cycles: {}", report.total_instruction_count());
