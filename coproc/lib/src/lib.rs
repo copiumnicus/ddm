@@ -117,11 +117,16 @@ pub fn process_txs(v: &[u8]) -> Vec<StateDelta> {
     assert!(fee_atoms >= 0);
     let total_tx = inp.total_tx();
     for offset in 0..total_tx {
+        println!("cycle-tracker-start: apply_tx");
         let tx = inp.tx_at(offset);
         // 1. hash the tx
         // 2. recover sig addr
+        println!("cycle-tracker-start: keccak");
         tx.keccak(&mut digest);
+        println!("cycle-tracker-end: keccak");
+        println!("cycle-tracker-start: recover");
         let from = recover(&tx, &digest);
+        println!("cycle-tracker-end: recover");
         let atoms = tx.atoms();
         assert!(atoms > fee_atoms);
         let to_recipient = atoms - fee_atoms;
@@ -130,6 +135,7 @@ pub fn process_txs(v: &[u8]) -> Vec<StateDelta> {
         apply_sender_delta(&mut deltas, tx.from_idx(), from, tx.nonce(), -atoms);
         apply_delta(&mut deltas, tx.to_idx(), to, to_recipient);
         apply_delta(&mut deltas, 0, fee_recipient, to_fee_sink);
+        println!("cycle-tracker-end: apply_tx");
     }
 
     deltas

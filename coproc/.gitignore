@@ -3,6 +3,8 @@
 
 # Cargo config
 .cargo
+.venv
+.claude
 
 # Profile-guided optimization
 /tmp
