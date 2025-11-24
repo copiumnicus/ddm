@@ -1,0 +1,36 @@
+[package]
+version = "0.1.0"
+name = "fibonacci-script"
+edition = "2021"
+default-run = "fibonacci"
+
+[[bin]]
+name = "fibonacci"
+path = "src/bin/main.rs"
+
+[[bin]]
+name = "evm"
+path = "src/bin/evm.rs"
+
+[[bin]]
+name = "vkey"
+path = "src/bin/vkey.rs"
+
+[dependencies]
+sp1-sdk = "5.0.8"
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+serde = { version = "1.0.200", default-features = false, features = ["derive"] }
+clap = { version = "4.0", features = ["derive", "env"] }
+tracing = "0.1.40"
+hex = "0.4.3"
+alloy-sol-types = { workspace = true }
+fibonacci-lib = { path = "../lib" }
+dotenv = "0.15.0"
+k256 = { version = "0.13", features = ["ecdsa", "schnorr", "sha256"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+
+[build-dependencies]
+sp1-build = "5.0.8"
